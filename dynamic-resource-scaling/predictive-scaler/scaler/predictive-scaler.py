@@ -17,10 +17,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+
 # Project layout:
 # dynamic-resource-scaling/
 #   monitoring/monitoring.py
-#   scaler/scaler.py
+#   predictive-scaler/scaler2.py
 #   scaling_results.csv
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -43,17 +44,14 @@ HISTORY_WINDOW = int(os.getenv("PREDICTION_HISTORY_WINDOW", "12"))
 MIN_HISTORY_SAMPLES = int(os.getenv("MIN_HISTORY_SAMPLES", "3"))
 
 # Predictive scale-up thresholds in aggregate CPU millicores.
-# Each crossed threshold adds one Pod to the desired replica count.
 SCALE_UP_THRESHOLDS_M = [150, 200, 250, 300]
 
-# Lower thresholds provide hysteresis for scaling down.
-# For example, after scaling up at 150m, don't scale down again
-# until forecast CPU falls below 120m.
+# Lower thresholds provide hysteresis for predictive scale-down.
 SCALE_DOWN_THRESHOLDS_M = [120, 170, 220, 270]
 
-# Require sustained low forecast before scaling down.
+# Require repeated low forecasts before predictive scale-down.
 PREDICTIVE_DOWNSCALE_CONFIRMATIONS = int(
-    os.getenv("PREDICTIVE_DOWNSCALE_CONFIRMATIONS", "2")
+    os.getenv("PREDICTIVE_DOWNSCALE_CONFIRMATIONS", "3")
 )
 
 # Reactive fallback thresholds based on total CPU utilization percentage.
@@ -61,7 +59,7 @@ CPU_SCALE_UP_THRESHOLD = float(os.getenv("CPU_SCALE_UP_THRESHOLD", "70"))
 CPU_SCALE_DOWN_THRESHOLD = float(os.getenv("CPU_SCALE_DOWN_THRESHOLD", "30"))
 
 SCALE_UP_CONFIRMATIONS = 1
-SCALE_DOWN_CONFIRMATIONS = 2
+SCALE_DOWN_CONFIRMATIONS = 3
 COOLDOWN_PERIOD = int(os.getenv("SCALER_COOLDOWN_SECONDS", "10"))
 
 scale_up_counter = 0
@@ -155,6 +153,12 @@ def read_history() -> list[tuple[float, float]]:
         ) as handle:
             reader = csv.DictReader(handle)
 
+            # Handle whitespace around CSV headers and values.
+            if reader.fieldnames:
+                reader.fieldnames = [
+                    name.strip() for name in reader.fieldnames
+                ]
+
             required = {"timestamp", "total_cpu_millicores"}
 
             if (
@@ -169,15 +173,21 @@ def read_history() -> list[tuple[float, float]]:
 
             for row in reader:
                 try:
+                    cleaned_row = {
+                        key.strip(): value.strip() if value else value
+                        for key, value in row.items()
+                        if key is not None
+                    }
+
                     stamp = datetime.fromisoformat(
-                        row["timestamp"].strip()
+                        cleaned_row["timestamp"]
                     ).timestamp()
-                    cpu = float(row["total_cpu_millicores"])
+                    cpu = float(cleaned_row["total_cpu_millicores"])
 
                     if math.isfinite(stamp) and math.isfinite(cpu) and cpu >= 0:
                         samples.append((stamp, cpu))
 
-                except (TypeError, ValueError, AttributeError):
+                except (TypeError, ValueError, AttributeError, KeyError):
                     continue
 
     except OSError as exc:
@@ -207,7 +217,7 @@ def predict_cpu(
     if denominator <= 1e-9:
         return None
 
-    # Least-squares regression: calculate the CPU trend per second.
+    # Least-squares regression: calculate CPU trend per second.
     slope = sum(
         (x - x_mean) * (y - y_mean)
         for x, y in zip(xs, ys)
@@ -220,7 +230,7 @@ def predict_cpu(
 
 
 def replicas_for_scale_up(predicted_cpu_m: float) -> int:
-    """Calculate the target replica count using ascending CPU thresholds."""
+    """Calculate target replicas using ascending CPU thresholds."""
     crossed_thresholds = sum(
         predicted_cpu_m >= threshold
         for threshold in SCALE_UP_THRESHOLDS_M
@@ -232,7 +242,7 @@ def replicas_for_scale_up(predicted_cpu_m: float) -> int:
 
 
 def replicas_for_scale_down(predicted_cpu_m: float) -> int:
-    """Calculate the replica target using lower downscale thresholds."""
+    """Calculate target replicas using lower downscale thresholds."""
     crossed_thresholds = sum(
         predicted_cpu_m >= threshold
         for threshold in SCALE_DOWN_THRESHOLDS_M
@@ -272,13 +282,15 @@ def main() -> None:
     log("Multi-step predictive + reactive scaler started")
     log(f"CSV: {CSV_FILE}")
     log(
-        f"Deployment={DEPLOYMENT}, replica range={MIN_REPLICAS}-{MAX_REPLICAS}"
+        f"Deployment={DEPLOYMENT}, "
+        f"replica range={MIN_REPLICAS}-{MAX_REPLICAS}"
     )
     log(f"Scale-up thresholds: {SCALE_UP_THRESHOLDS_M}")
     log(f"Scale-down thresholds: {SCALE_DOWN_THRESHOLDS_M}")
     log(
         f"Prediction horizon={PREDICTION_HORIZON_SECONDS}s, "
-        f"check interval={CHECK_INTERVAL}s, cooldown={COOLDOWN_PERIOD}s"
+        f"check interval={CHECK_INTERVAL}s, "
+        f"cooldown={COOLDOWN_PERIOD}s"
     )
 
     while True:
@@ -286,7 +298,7 @@ def main() -> None:
             replicas = get_replicas()
             current_cpu_m, measured_pods = get_cpu_usage()
 
-            # Calculate utilization across the total configured CPU capacity.
+            # Calculate utilization against the Deployment's total CPU limit.
             current_cpu_pct = (
                 current_cpu_m / (replicas * CPU_LIMIT_PER_POD_M) * 100
                 if measured_pods > 0
@@ -320,6 +332,19 @@ def main() -> None:
                 f"CSV samples={len(history)}, replicas={replicas}"
             )
 
+            # A forecast that recommends the current replica count or more
+            # prevents reactive scale-down from undoing predictive decisions.
+            forecast_target = (
+                replicas_for_scale_up(predicted_cpu_m)
+                if predicted_cpu_m is not None
+                else None
+            )
+
+            forecast_blocks_downscale = (
+                forecast_target is not None
+                and forecast_target >= replicas
+            )
+
             # -------------------------------------------------
             # 1. Predictive scaling
             # -------------------------------------------------
@@ -327,10 +352,10 @@ def main() -> None:
                 up_target = replicas_for_scale_up(predicted_cpu_m)
                 down_target = replicas_for_scale_down(predicted_cpu_m)
 
-                # Scale up one Pod at a time. If the forecast remains high,
-                # later checks can add more Pods after the cooldown.
+                # Predictive scale-up takes priority over reactive downscale.
                 if up_target > replicas:
                     predictive_down_counter = 0
+                    scale_down_counter = 0
 
                     if cooldown_done:
                         next_replicas = min(replicas + 1, up_target)
@@ -343,11 +368,13 @@ def main() -> None:
 
                         scale_up_counter = 0
                         scale_down_counter = 0
+                        predictive_down_counter = 0
 
                         time.sleep(CHECK_INTERVAL)
                         continue
 
-                # Scale down one Pod at a time after repeated low forecasts.
+                # Predictive scale-down is allowed only after repeated
+                # low-forecast checks and only when its target is lower.
                 elif down_target < replicas:
                     predictive_down_counter += 1
 
@@ -389,6 +416,7 @@ def main() -> None:
                 scale_down_counter = 0
 
             elif current_cpu_pct > CPU_SCALE_UP_THRESHOLD:
+                # High current CPU remains a fast reactive safety fallback.
                 scale_up_counter += 1
                 scale_down_counter = 0
 
@@ -401,24 +429,43 @@ def main() -> None:
                         replicas + 1,
                         f"reactive fallback: CPU={current_cpu_pct:.1f}%",
                     )
+
                     scale_up_counter = 0
                     scale_down_counter = 0
+                    predictive_down_counter = 0
 
             elif current_cpu_pct < CPU_SCALE_DOWN_THRESHOLD:
-                scale_down_counter += 1
                 scale_up_counter = 0
 
-                if (
-                    scale_down_counter >= SCALE_DOWN_CONFIRMATIONS
-                    and replicas > MIN_REPLICAS
-                    and cooldown_done
-                ):
-                    scale(
-                        replicas - 1,
-                        f"reactive fallback: CPU={current_cpu_pct:.1f}%",
-                    )
+                if forecast_blocks_downscale:
+                    # Do not let low current CPU contradict a forecast
+                    # that says the current capacity is still required.
                     scale_down_counter = 0
-                    scale_up_counter = 0
+                    log(
+                        "Reactive scale-down held: forecast target "
+                        f"is {forecast_target} replicas"
+                    )
+                else:
+                    scale_down_counter += 1
+
+                    log(
+                        "Low CPU confirmation "
+                        f"{scale_down_counter}/{SCALE_DOWN_CONFIRMATIONS}"
+                    )
+
+                    if (
+                        scale_down_counter >= SCALE_DOWN_CONFIRMATIONS
+                        and replicas > MIN_REPLICAS
+                        and cooldown_done
+                    ):
+                        scale(
+                            replicas - 1,
+                            f"reactive fallback: CPU={current_cpu_pct:.1f}%",
+                        )
+
+                        scale_down_counter = 0
+                        scale_up_counter = 0
+                        predictive_down_counter = 0
 
             else:
                 scale_up_counter = 0
@@ -426,7 +473,10 @@ def main() -> None:
                 log("CPU is within the reactive normal range")
 
         except subprocess.TimeoutExpired:
-            log("kubectl timed out; check Kubernetes connectivity and metrics-server")
+            log(
+                "kubectl timed out; check Kubernetes connectivity "
+                "and metrics-server"
+            )
 
         except subprocess.CalledProcessError as exc:
             detail = (exc.stderr or exc.stdout or str(exc)).strip()
