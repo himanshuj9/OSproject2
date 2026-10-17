@@ -1,0 +1,11 @@
+minikube start --driver=docker
+
+kubectl port-forward service/scaling-demo-service 5000:80
+
+python scaler/predictive-scaler.py
+
+python monitoring/monitor2.py
+
+python load_generator/load_generator.py
+
+python live_chart2.py
